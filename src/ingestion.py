@@ -272,13 +272,16 @@ def fetch_paper(source_id: str, download_pdf: bool = True, usage: dict = None) -
     mode = "abstract_only"
 
     if download_pdf and fitz is not None:
+        pdf_path = None
         try:
             if not result.pdf_url:
                 raise IngestionError("No pdf_url available for this paper")
             pdf_resp = requests.get(result.pdf_url, timeout=30)
             pdf_resp.raise_for_status()
-            pdf_path = os.path.join(tempfile.gettempdir(), f"{source_id.replace('/', '_')}.pdf")
-            with open(pdf_path, "wb") as f:
+            # A unique temp file per download, deleted below once the text is
+            # extracted - the PDF itself is never needed again.
+            fd, pdf_path = tempfile.mkstemp(prefix="papercast_", suffix=".pdf")
+            with os.fdopen(fd, "wb") as f:
                 f.write(pdf_resp.content)
             extracted = _extract_intro_and_conclusion(pdf_path)
             if len(extracted) >= config.ABSTRACT_ONLY_FALLBACK_THRESHOLD:
@@ -286,6 +289,12 @@ def fetch_paper(source_id: str, download_pdf: bool = True, usage: dict = None) -
                 mode = "full"
         except Exception as e:
             logger.warning(f"PDF download/extraction failed for {source_id}, falling back to abstract: {e}")
+        finally:
+            if pdf_path:
+                try:
+                    os.remove(pdf_path)
+                except OSError:
+                    pass
 
     if mode == "abstract_only":
         full_text = abstract

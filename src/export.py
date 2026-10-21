@@ -6,9 +6,28 @@ two always produce the same files. Both formats carry the source papers and
 the grounding results, so a saved transcript says how far to trust it.
 """
 import json
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from .models import DebateScript, PaperData
+
+
+def number_papers(papers: List[PaperData]) -> Dict[str, int]:
+    """paper_id -> 1-based number, so scripts can cite papers as [1], [2]
+    instead of long IDs (a PDF's ID is a hash, and old runs used file paths)."""
+    return {p.paper_id: i + 1 for i, p in enumerate(papers)}
+
+
+def source_label(paper: PaperData) -> str:
+    """Short human-readable origin of a paper, e.g. 'arXiv 2306.07691'."""
+    pid = paper.paper_id
+    if pid.startswith("pdf-") or pid.lower().endswith(".pdf"):
+        return "Uploaded PDF"
+    return f"arXiv {pid}"
+
+
+def cite_marks(paper_ids: List[str], numbers: Dict[str, int]) -> str:
+    """'[1][2]' for the given IDs; an ID that isn't in this run shows as [?]."""
+    return "".join(f"[{numbers[pid]}]" if pid in numbers else "[?]" for pid in paper_ids)
 
 
 def script_to_markdown(
@@ -17,14 +36,16 @@ def script_to_markdown(
     grounding_report: Optional[dict] = None,
     script_grounding_report: Optional[dict] = None,
 ) -> str:
+    numbers = number_papers(papers)
     out = ["# PaperCast Transcript", "", "## Source papers", ""]
     for p in papers:
         authors = ", ".join(p.authors) if p.authors else "unknown authors"
-        out.append(f"- **{p.title}** ({p.paper_id}) - {authors} [{p.extraction_mode}]")
+        mode = "" if p.extraction_mode == "full" else f" ({p.extraction_mode.replace('_', ' ')})"
+        out.append(f"{numbers[p.paper_id]}. **{p.title}** - {authors} - {source_label(p)}{mode}")
 
     out += ["", "## Transcript", ""]
     for line in script.lines:
-        refs = f" _(refs: {', '.join(line.cites_paper_ids)})_" if line.cites_paper_ids else ""
+        refs = f" {cite_marks(line.cites_paper_ids, numbers)}" if line.cites_paper_ids else ""
         out.append(f"**{line.speaker}:** {line.text}{refs}")
         out.append("")
 
@@ -37,7 +58,7 @@ def script_to_markdown(
             f" (rate {grounding_report.get('grounding_rate', 1.0):.0%})",
         ]
         for f in grounding_report.get("flagged", []):
-            out.append(f"- Unverified quote in {f['paper_id']}: \"{f['quote']}\"")
+            out.append(f"- Unverified quote in {cite_marks([f['paper_id']], numbers)}: \"{f['quote']}\"")
         out.append("")
 
     if script_grounding_report:

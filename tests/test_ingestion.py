@@ -1,5 +1,7 @@
 """Ingestion: ID validation, retry behaviour, stable PDF IDs, token counting,
 and the arXiv cache. No test touches the network."""
+import os
+
 import arxiv
 import pymupdf
 import pytest
@@ -144,3 +146,29 @@ def test_corrupt_cache_is_a_miss(fake_arxiv):
     paper = ingestion.fetch_paper("2306.07691")
     assert paper.extraction_mode == "abstract_only"
     assert len(fake_arxiv.calls) == 1
+
+
+@pytest.mark.parametrize("pdf_lines", [LONG_LINES, []], ids=["extracted", "too-little-text"])
+def test_downloaded_pdf_is_deleted_after_extraction(fake_arxiv, tmp_path, monkeypatch, pdf_lines):
+    pdf = tmp_path / "paper.pdf"
+    make_pdf(pdf, pdf_lines)
+    fake_arxiv.pdf_url = "http://example.test/paper.pdf"
+
+    class FakeResponse:
+        content = pdf.read_bytes()
+        def raise_for_status(self):
+            pass
+
+    monkeypatch.setattr(ingestion.requests, "get", lambda *a, **k: FakeResponse())
+
+    created = []
+    real_mkstemp = ingestion.tempfile.mkstemp
+    def recording_mkstemp(*a, **k):
+        fd, path = real_mkstemp(*a, **k)
+        created.append(path)
+        return fd, path
+    monkeypatch.setattr(ingestion.tempfile, "mkstemp", recording_mkstemp)
+
+    ingestion.fetch_paper("2306.07691")
+    assert len(created) == 1
+    assert not os.path.exists(created[0])

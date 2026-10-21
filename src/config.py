@@ -74,6 +74,10 @@ ARXIV_CACHE_DIR = os.path.join(_ROOT, "cache", "arxiv")
 # SQLite file the dashboard uses for LangGraph checkpoints, so a paused
 # review survives a page refresh or a Streamlit restart.
 CHECKPOINT_DB = os.path.join(_ROOT, "checkpoints.sqlite")
+# Runs whose last activity is older than this are deleted from the file when
+# the dashboard starts, so it doesn't grow forever. A review left paused
+# longer than this is lost.
+CHECKPOINT_RETENTION_DAYS = 7
 
 # --- RAG -----------------------------------------------------------------
 # Local, persistent vector store of every paper this tool has ever

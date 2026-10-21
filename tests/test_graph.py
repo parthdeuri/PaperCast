@@ -104,3 +104,24 @@ def test_sqlite_checkpoint_resumes_from_new_graph_instance(fake_arxiv, tmp_path)
         assert values["final_script"].lines
     finally:
         second.checkpointer.conn.close()
+
+
+def test_prune_old_threads_deletes_only_old_runs(fake_arxiv, tmp_path):
+    from src.graph import prune_old_threads
+
+    app = build_graph(str(tmp_path / "cp.sqlite"))
+    try:
+        configs = [new_config(), new_config()]
+        for cfg in configs:
+            run_graph(app, {**INPUTS, "human_in_loop": False}, cfg)
+
+        # Both runs are seconds old: a 1-day limit keeps them.
+        assert prune_old_threads(app.checkpointer, max_age_days=1) == 0
+        assert all(app.get_state(cfg).values for cfg in configs)
+
+        # A 0-day limit makes both "old": they are deleted completely.
+        assert prune_old_threads(app.checkpointer, max_age_days=0) == 2
+        assert all(app.get_state(cfg).values == {} for cfg in configs)
+        assert prune_old_threads(app.checkpointer, max_age_days=0) == 0
+    finally:
+        app.checkpointer.conn.close()

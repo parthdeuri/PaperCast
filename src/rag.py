@@ -21,6 +21,7 @@ an empty result rather than raising - RAG is a pure enhancement layer, never
 a hard dependency for getting a script out of the pipeline.
 """
 import re
+import hashlib
 import logging
 from typing import List, Optional
 
@@ -101,7 +102,38 @@ def _get_collection():
     _collection = client.get_or_create_collection(
         name="paper_library", embedding_function=embed_fn
     )
+    _migrate_path_ids(_collection)
     return _collection
+
+
+def _is_path_id(paper_id: str) -> bool:
+    return paper_id.lower().endswith(".pdf") and ("/" in paper_id or "\\" in paper_id)
+
+
+def _migrate_path_ids(collection) -> None:
+    """Older versions used an uploaded PDF's temp-file path as its paper ID.
+    Rename those entries to a stable 'pdf-legacy-<hash>' ID, keeping their
+    stored text and embeddings (so no model load). Runs on every open but
+    does nothing once no path IDs are left. Best-effort."""
+    try:
+        ids = collection.get(include=[])["ids"]
+        old_ids = [i for i in ids if _is_path_id(i)]
+        if not old_ids:
+            return
+        old = collection.get(ids=old_ids, include=["embeddings", "documents", "metadatas"])
+        new_ids, metadatas = [], []
+        for old_id, meta in zip(old["ids"], old["metadatas"]):
+            new_id = "pdf-legacy-" + hashlib.sha256(old_id.encode("utf-8")).hexdigest()[:10]
+            new_ids.append(new_id)
+            metadatas.append({**(meta or {}), "paper_id": new_id})
+        collection.upsert(
+            ids=new_ids, embeddings=old["embeddings"],
+            documents=old["documents"], metadatas=metadatas,
+        )
+        collection.delete(ids=old["ids"])
+        logger.info(f"Renamed {len(new_ids)} RAG library entries with path IDs")
+    except Exception as e:
+        logger.warning(f"Could not rename path IDs in the RAG library: {e}")
 
 
 def add_paper_to_library(paper: PaperData, summary: PaperSummary) -> None:

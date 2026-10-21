@@ -23,8 +23,9 @@ def sample(make_paper):
 def test_markdown_contents(make_paper):
     md = script_to_markdown(*sample(make_paper))
     assert "**Host:** Welcome." in md
-    assert "**Academic:** It reaches 99.9%. _(refs: 2306.07691)_" in md
-    assert "Paper 2306.07691" in md and "Ada Lovelace" in md
+    assert "**Academic:** It reaches 99.9%. [1]" in md
+    assert "1. **Paper 2306.07691** - Ada Lovelace - arXiv 2306.07691" in md
+    assert "Unverified quote in [1]" in md
     assert "1/2" in md and "50%" in md  # citation grounding
     assert "made up" in md
     assert "Line 2 (Academic)" in md  # script check, 1-based
@@ -43,3 +44,19 @@ def test_export_without_reports(make_paper):
     script, papers, _, _ = sample(make_paper)
     assert "## Grounding" not in script_to_markdown(script, papers)
     assert json.loads(script_to_json(script, papers))["grounding_report"] == {}
+
+
+def test_refs_use_numbers_not_ids(make_paper):
+    from src.export import cite_marks, number_papers, source_label
+    papers = [make_paper("2306.07691"), make_paper("pdf-3fa91c2e7b")]
+    numbers = number_papers(papers)
+    assert cite_marks(["pdf-3fa91c2e7b", "2306.07691", "9999.99999"], numbers) == "[2][1][?]"
+    assert source_label(papers[0]) == "arXiv 2306.07691"
+    assert source_label(papers[1]) == "Uploaded PDF"
+    assert source_label(make_paper("C:/Temp/old upload.pdf")) == "Uploaded PDF"
+    md = script_to_markdown(
+        DebateScript(lines=[DialogueLine(speaker="Host", text="Hi.", cites_paper_ids=["pdf-3fa91c2e7b"])]),
+        papers,
+    )
+    [line] = [l for l in md.splitlines() if l.startswith("**Host:**")]
+    assert line == "**Host:** Hi. [2]"

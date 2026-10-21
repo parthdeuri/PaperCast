@@ -25,6 +25,7 @@ an in-memory one by default (CLI, tests) or a SQLite file when given a path
 """
 import sqlite3
 import time
+from datetime import datetime, timedelta, timezone
 
 from langgraph.graph import StateGraph, END
 from langgraph.types import interrupt
@@ -138,6 +139,29 @@ def build_graph(checkpoint_db: str = None):
     else:
         checkpointer = MemorySaver(serde=serde)
     return graph.compile(checkpointer=checkpointer)
+
+
+def prune_old_threads(checkpointer, max_age_days: float) -> int:
+    """Delete every run (thread) whose newest checkpoint is older than
+    `max_age_days`. Returns how many were deleted. Whole threads are
+    deleted, never single checkpoints, so a kept run is always complete."""
+    cutoff = datetime.now(timezone.utc) - timedelta(days=max_age_days)
+    newest = {}
+    for tup in checkpointer.list(None):
+        thread_id = tup.config["configurable"]["thread_id"]
+        ts = datetime.fromisoformat(tup.checkpoint["ts"])
+        if thread_id not in newest or ts > newest[thread_id]:
+            newest[thread_id] = ts
+
+    old = [t for t, ts in newest.items() if ts < cutoff]
+    for thread_id in old:
+        checkpointer.delete_thread(thread_id)
+
+    # SQLite keeps freed pages until VACUUM, so the file wouldn't shrink.
+    conn = getattr(checkpointer, "conn", None)
+    if old and conn is not None:
+        conn.execute("VACUUM")
+    return len(old)
 
 
 def run_graph(app, inputs_or_command, config, on_step=None):

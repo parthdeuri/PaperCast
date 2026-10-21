@@ -23,26 +23,56 @@ import os
 import json
 import uuid
 import hashlib
+import html
+import shutil
 import tempfile
+import time
 import pandas as pd
 import plotly.express as px
 import streamlit as st
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.graph import build_graph, run_graph
+from src.graph import build_graph, run_graph, prune_old_threads
 from src.cost_tracker import load_all_runs
-from src.export import script_to_markdown, script_to_json
+from src.export import script_to_markdown, script_to_json, number_papers, source_label
 from src import config as podcast_config
 from langgraph.types import Command
 
 st.set_page_config(page_title="PaperCast", layout="wide")
 
 
+def _remove_stale_temp_files(max_age_hours: float = 24):
+    """Upload folders and downloaded PDFs are deleted right after use; this
+    catches any left behind by a crash or a killed server."""
+    cutoff = time.time() - max_age_hours * 3600
+    tmp = tempfile.gettempdir()
+    for name in os.listdir(tmp):
+        if not name.startswith("papercast_"):
+            continue
+        path = os.path.join(tmp, name)
+        try:
+            if os.path.getmtime(path) < cutoff:
+                if os.path.isdir(path):
+                    shutil.rmtree(path, ignore_errors=True)
+                else:
+                    os.remove(path)
+        except OSError:
+            pass
+
+
 @st.cache_resource
 def get_app():
     # One graph (and one SQLite connection) shared by every session and rerun.
-    return build_graph(podcast_config.CHECKPOINT_DB)
+    # Housekeeping runs here because this executes once per server start.
+    app = build_graph(podcast_config.CHECKPOINT_DB)
+    try:
+        prune_old_threads(app.checkpointer, podcast_config.CHECKPOINT_RETENTION_DAYS)
+        _remove_stale_temp_files()
+    except Exception as e:
+        # Cleanup is best-effort; never let it stop the dashboard loading.
+        print(f"[dashboard] startup cleanup failed: {e}")
+    return app
 
 
 app = get_app()
@@ -104,9 +134,99 @@ def run_with_progress(inputs_or_command, label):
             status.update(label="Pipeline failed", state="error")
             st.error(f"Pipeline failed: {e}")
             return False
-        status.update(label="Paused for review" if payload is not None else "Done", state="complete")
+        # Collapse the step list once finished; it stays one click away.
+        status.update(label="Paused for review" if payload is not None else "Done",
+                      state="complete", expanded=False)
     apply_outcome(values, payload)
     return True
+
+
+# ---------------------------------------------------------------------------
+# Presentation helpers. Citations show as short numbered chips ([1], [2]);
+# hovering one shows the paper's full title and ID, so long IDs (a PDF's
+# hash, or a file path from an old run) never clutter the script.
+# ---------------------------------------------------------------------------
+SPEAKERS = {"Host": ("🎙️", "#8b5cf6"), "Academic": ("🎓", "#0ea5e9"), "Skeptic": ("🧐", "#f97316")}
+
+st.markdown(
+    """<style>
+.pc-line{display:flex;flex-wrap:wrap;gap:.25rem .75rem;padding:.6rem .85rem;margin:.4rem 0;
+  border-radius:.6rem;background:rgba(128,128,128,.08);border-left:3px solid var(--pc-c);}
+.pc-speaker{font-weight:600;color:var(--pc-c);min-width:7rem;}
+.pc-text{flex:1 1 20rem;line-height:1.55;}
+.pc-ref{display:inline-block;font-size:.72rem;font-weight:600;line-height:1.4;padding:0 .4rem;
+  margin-left:.25rem;border-radius:.5rem;background:rgba(99,102,241,.18);cursor:help;vertical-align:1px;}
+.pc-ref.pc-unknown{background:rgba(239,68,68,.22);}
+.pc-flag{flex-basis:100%;font-size:.8rem;color:#ea580c;}
+.pc-sources{margin:.25rem 0 .75rem;font-size:.9rem;}
+.pc-sources div{margin:.2rem 0;}
+.pc-muted{opacity:.65;font-size:.82rem;}
+</style>""",
+    unsafe_allow_html=True,
+)
+
+
+def ref_chips(paper_ids, papers) -> str:
+    """HTML chips like [1][2] with the full title and ID as a hover tooltip."""
+    numbers = number_papers(papers)
+    by_id = {p.paper_id: p for p in papers}
+    chips = []
+    for pid in paper_ids:
+        if pid in by_id:
+            p = by_id[pid]
+            label = source_label(p)
+            tip = f"{p.title} - {label}" + ("" if pid in label else f" ({pid})")
+            chips.append(f'<span class="pc-ref" title="{html.escape(tip)}">{numbers[pid]}</span>')
+        else:
+            tip = f"Not a paper in this run: {pid}"
+            chips.append(f'<span class="pc-ref pc-unknown" title="{html.escape(tip)}">?</span>')
+    return "".join(chips)
+
+
+def with_numbers(text: str, papers) -> str:
+    """Replace paper IDs inside a message (e.g. a grounding reason) with [n]."""
+    for pid, n in sorted(number_papers(papers).items(), key=lambda kv: -len(kv[0])):
+        text = text.replace(pid, f"[{n}]")
+    return text
+
+
+def render_sources(papers):
+    rows = []
+    for p in papers:
+        mode = "" if p.extraction_mode == "full" else " · abstract only"
+        rows.append(
+            f"<div>{ref_chips([p.paper_id], papers)} <b>{html.escape(p.title)}</b> "
+            f'<span class="pc-muted">{html.escape(source_label(p))}{mode}</span></div>'
+        )
+    st.markdown(f'<div class="pc-sources">{"".join(rows)}</div>', unsafe_allow_html=True)
+
+
+def render_script(lines, papers, flags_by_line=None):
+    """The script as one block of speaker-coloured lines with citation chips."""
+    flags_by_line = flags_by_line or {}
+    blocks = []
+    for i, line in enumerate(lines):
+        icon, color = SPEAKERS.get(line.speaker, ("💬", "#64748b"))
+        flag = ""
+        if i in flags_by_line:
+            reasons = with_numbers("; ".join(flags_by_line[i]["reasons"]), papers)
+            flag = f'<div class="pc-flag">⚠️ {html.escape(reasons)}</div>'
+        blocks.append(
+            f'<div class="pc-line" style="--pc-c:{color}">'
+            f'<div class="pc-speaker">{icon} {html.escape(line.speaker)}</div>'
+            f'<div class="pc-text">{html.escape(line.text)}{ref_chips(line.cites_paper_ids, papers)}</div>'
+            f"{flag}</div>"
+        )
+    st.markdown("".join(blocks), unsafe_allow_html=True)
+
+
+def run_papers():
+    """Papers of the current run, read from its checkpoint (the review
+    payload itself doesn't carry them)."""
+    try:
+        return app.get_state(thread_config()).values.get("papers", [])
+    except Exception:
+        return []
 
 
 # ---------------------------------------------------------------------------
@@ -145,13 +265,17 @@ with st.sidebar:
                 "you download them (see README.md for the download commands)."
             )
 
+st.title("🎙️ PaperCast")
+st.caption("Turn 1-3 research papers into a debate between a Host, an Academic and a Skeptic - "
+           "with every quote and number checked against the source papers.")
+
 tab_run, tab_dashboard, tab_library = st.tabs(["🎙️ Run Pipeline", "📊 Cost & Latency", "📚 Library Management"])
 
 # ---------------------------------------------------------------------------
 # TAB 1: Run pipeline + human-in-the-loop review + audio generation
 # ---------------------------------------------------------------------------
 with tab_run:
-    st.header("Generate a Debate Episode")
+    st.subheader("Generate a debate episode")
 
     col1, col2 = st.columns([3, 1])
     with col1:
@@ -176,6 +300,7 @@ with tab_run:
                      "upload the file with the uploader below instead.")
         else:
             input_sources = list(arxiv_ids)
+            upload_dir = None
             if uploaded_files:
                 # A fresh folder per run, so same-named uploads never collide.
                 upload_dir = tempfile.mkdtemp(prefix="papercast_")
@@ -195,54 +320,77 @@ with tab_run:
             st.session_state.audio_error = None
             st.session_state.pending_interrupt = None
             st.session_state.result = None
-            run_with_progress(
-                {"input_sources": input_sources, "human_in_loop": human_in_loop},
-                "Running: ingest → academic → grounding → rag → skeptic → host → script check",
-            )
+            try:
+                run_with_progress(
+                    {"input_sources": input_sources, "human_in_loop": human_in_loop},
+                    "Running: ingest → academic → grounding → rag → skeptic → host → script check",
+                )
+            finally:
+                # Ingestion has read the uploads by now (their text lives in
+                # the run's state), and nothing - not even a resumed review -
+                # opens the files again.
+                if upload_dir:
+                    shutil.rmtree(upload_dir, ignore_errors=True)
 
     # --- Human review UI (only shown when the graph is actually paused) ---
     if st.session_state.pending_interrupt:
         payload = st.session_state.pending_interrupt
-        st.warning("⏸️ Pipeline paused for human review.")
+        papers = run_papers()
+        st.divider()
+        st.subheader("⏸️ Review the draft")
+        st.caption("Edit any line, then approve - or tell the Host what to change and regenerate.")
 
         gr = payload["grounding_report"]
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Citations verified", f"{gr['verified_citations']}/{gr['total_citations']}")
-        c2.metric("Grounding rate", f"{gr['grounding_rate']:.0%}")
-        c3.metric("Flagged (possibly hallucinated)", gr["hallucinated_citations"])
-        if gr["flagged"]:
-            st.error("⚠️ Some citations could not be verified against the source paper:")
-            for f in gr["flagged"]:
-                st.text(f"  [{f['paper_id']}] \"{f['quote']}\" (match score {f['match_score']})")
-
         script_flags = payload.get("script_grounding_report", {}).get("flagged_lines", [])
         flags_by_line = {f["index"]: f for f in script_flags}
-        if script_flags:
-            st.error(f"⚠️ {len(script_flags)} script line(s) have claims that could not be checked "
-                     "against the source papers (shown below with a warning):")
-            for f in script_flags:
-                st.text(f"  line {f['index'] + 1} [{f['speaker']}]: {'; '.join(f['reasons'])}")
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Quotes verified", f"{gr['verified_citations']}/{gr['total_citations']}",
+                  help="Academic's quotes found in the source text")
+        c2.metric("Unverified quotes", gr["hallucinated_citations"])
+        c3.metric("Script lines flagged", len(script_flags),
+                  help="Lines citing an unknown paper, or a number not found in the cited paper")
+        if gr["flagged"]:
+            with st.expander(f"⚠️ {len(gr['flagged'])} quote(s) could not be found in the source paper"):
+                for f in gr["flagged"]:
+                    st.markdown(
+                        f"{ref_chips([f['paper_id']], papers)} \"{html.escape(f['quote'])}\" "
+                        f'<span class="pc-muted">match {f["match_score"]:.2f}</span>',
+                        unsafe_allow_html=True,
+                    )
+
+        if papers:
+            st.markdown("**Sources** <span class='pc-muted'>(hover a number for details)</span>",
+                        unsafe_allow_html=True)
+            render_sources(papers)
 
         # Widget keys include a hash of the draft, so a regenerated draft gets
         # fresh editors instead of inheriting the previous draft's edits.
         draft_id = hashlib.md5(json.dumps(payload["draft_script"], sort_keys=True).encode()).hexdigest()[:8]
 
-        st.subheader("Edit the script")
+        st.markdown("**Script**")
         edited_lines = []
         for i, line in enumerate(payload["draft_script"]):
-            cols = st.columns([1, 5])
+            cols = st.columns([1.5, 5])
             speaker = cols[0].selectbox(
-                "Speaker", ["Host", "Academic", "Skeptic"],
-                index=["Host", "Academic", "Skeptic"].index(line["speaker"]),
+                "Speaker", list(SPEAKERS),
+                index=list(SPEAKERS).index(line["speaker"]),
                 key=f"speaker_{draft_id}_{i}", label_visibility="collapsed",
+                format_func=lambda s: f"{SPEAKERS[s][0]} {s}",
             )
             text = cols[1].text_area(
                 "Line", value=line["text"], key=f"text_{draft_id}_{i}",
                 label_visibility="collapsed", height=68,
             )
+            cites = line.get("cites_paper_ids", [])
+            notes = []
+            if cites:
+                notes.append(f'<span class="pc-muted">cites</span>{ref_chips(cites, papers)}')
             if i in flags_by_line:
-                cols[1].caption(f"⚠️ {'; '.join(flags_by_line[i]['reasons'])}")
-            edited_lines.append({"speaker": speaker, "text": text, "cites_paper_ids": line.get("cites_paper_ids", [])})
+                reasons = with_numbers("; ".join(flags_by_line[i]["reasons"]), papers)
+                notes.append(f'<span class="pc-flag">⚠️ {html.escape(reasons)}</span>')
+            if notes:
+                cols[1].markdown(" &nbsp; ".join(notes), unsafe_allow_html=True)
+            edited_lines.append({"speaker": speaker, "text": text, "cites_paper_ids": cites})
 
         col_a, col_o = st.columns(2)
         approve_edited = col_a.button("✅ Approve (with my edits)", type="primary")
@@ -269,24 +417,32 @@ with tab_run:
     # --- Final result ---
     if st.session_state.result:
         result = st.session_state.result
-        st.subheader("🎬 Final Script")
-        for line in result["final_script"].lines:
-            refs = f"  _(refs: {', '.join(line.cites_paper_ids)})_" if line.cites_paper_ids else ""
-            st.markdown(f"**{line.speaker}:** {line.text}{refs}")
+        papers = result.get("papers", [])
+        script_report = result.get("script_grounding_report") or {}
+        script_flags = script_report.get("flagged_lines", [])
+        st.divider()
+        st.subheader("🎬 Final script")
 
         total_cost = sum(r.estimated_cost_usd for r in result["run_log"])
         total_time = sum(r.duration_s for r in result["run_log"])
-        m1, m2, m3 = st.columns(3)
-        m1.metric("Total cost (this run)", f"${total_cost:.4f}")
-        m2.metric("Total latency (this run)", f"{total_time:.2f}s")
-        m3.metric("Grounding rate", f"{result['grounding_report']['grounding_rate']:.0%}")
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Cost (this run)", f"${total_cost:.4f}")
+        m2.metric("Time (this run)", f"{total_time:.1f}s")
+        m3.metric("Quotes verified", f"{result['grounding_report']['grounding_rate']:.0%}")
+        m4.metric("Script lines flagged", len(script_flags))
+
+        if papers:
+            st.markdown("**Sources** <span class='pc-muted'>(hover a number for details)</span>",
+                        unsafe_allow_html=True)
+            render_sources(papers)
+        render_script(result["final_script"].lines, papers, {f["index"]: f for f in script_flags})
 
         # --- Transcript downloads ---
         export_args = (
             result["final_script"], result["papers"],
             result.get("grounding_report"), result.get("script_grounding_report"),
         )
-        d1, d2, _ = st.columns([1, 1, 3])
+        d1, d2, _ = st.columns([1, 1, 2])
         d1.download_button(
             "⬇️ Transcript (.md)", data=script_to_markdown(*export_args),
             file_name="transcript.md", mime="text/markdown",
@@ -401,8 +557,13 @@ with tab_library:
         
         st.subheader("Papers")
         for paper in papers:
-            col1, col2 = st.columns([5, 1])
-            col1.text(f"[{paper['id']}] {paper['title']}")
+            col1, col2 = st.columns([5, 1], vertical_alignment="center")
+            origin = "Uploaded PDF" if paper["id"].startswith("pdf-") else f"arXiv {paper['id']}"
+            col1.markdown(
+                f"<b>{html.escape(paper['title'])}</b><br>"
+                f'<span class="pc-muted" title="{html.escape(paper["id"])}">{html.escape(origin)}</span>',
+                unsafe_allow_html=True,
+            )
             if col2.button("Delete", key=f"del_{paper['id']}"):
                 if delete_from_library(paper['id']):
                     st.success(f"Deleted {paper['id']}")

@@ -56,7 +56,9 @@ review/dashboard UI.
   graph back to the Host. When off, `review_node` passes straight through -
   useful for scheduled/unattended runs. The CLI uses an in-memory
   checkpointer; the dashboard uses SQLite (`checkpoints.sqlite`), so a paused
-  review survives a page refresh or restart.
+  review survives a page refresh or restart. Runs older than 7 days are
+  deleted from it when the dashboard starts (`CHECKPOINT_RETENTION_DAYS`
+  in `src/config.py`), and uploaded PDFs are deleted once ingested.
 - **Cost/latency tracked per node**, not just per run, and persisted to
   `logs/run_log.jsonl` across every run so the dashboard shows trends, not
   just a single execution's numbers.
