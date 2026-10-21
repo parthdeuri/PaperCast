@@ -110,6 +110,9 @@ if "audio_path" not in st.session_state:
     st.session_state.audio_path = None
 if "audio_error" not in st.session_state:
     st.session_state.audio_error = None
+for _key in ("job", "notice", "last_steps", "audio_notice"):
+    if _key not in st.session_state:
+        st.session_state[_key] = None
 
 
 def apply_outcome(values, payload):
@@ -121,24 +124,160 @@ def apply_outcome(values, payload):
         st.session_state.result = values
 
 
-def run_with_progress(inputs_or_command, label):
-    """Run the graph with one line of progress per finished node. Returns
-    True if it ran without an exception."""
-    with st.status(label, expanded=True) as status:
+PIPELINE_LABEL = "Running: ingest → academic → grounding → rag → skeptic → host → script check"
+
+# ---------------------------------------------------------------------------
+# Jobs. Anything slow (a pipeline run, a resume, an audio render) is queued
+# as st.session_state.job by a button callback and then executed during the
+# script run that follows. While a job exists every start button is disabled
+# and a Stop button is shown. Stop works because Streamlit interrupts a
+# running script at its next st.* call - here, the progress update after
+# each pipeline step or audio line - so it takes effect once the step in
+# progress (e.g. one LLM call) finishes.
+# ---------------------------------------------------------------------------
+def set_notice(kind, text):
+    st.session_state.notice = (kind, text) if text else None
+
+
+def start_pipeline():
+    """Run button callback: validate the inputs, then queue the run."""
+    ids = [p.strip() for p in st.session_state.get("papers_input", "").split(",") if p.strip()]
+    pdf_entries = [p for p in ids if p.lower().endswith(".pdf")]
+    if pdf_entries:
+        # Typed paths would make the server read arbitrary local files.
+        set_notice("error", f"'{pdf_entries[0]}' looks like a PDF path. Paths can't be typed here - "
+                            "upload the file with the uploader instead.")
+        return
+
+    sources = list(ids)
+    upload_dir = None
+    uploads = st.session_state.get("uploads") or []
+    if uploads:
+        # A fresh folder per run, so same-named uploads never collide.
+        upload_dir = tempfile.mkdtemp(prefix="papercast_")
+        for i, uploaded_file in enumerate(uploads):
+            path = os.path.join(upload_dir, f"{i}_{os.path.basename(uploaded_file.name)}")
+            with open(path, "wb") as f:
+                f.write(uploaded_file.getbuffer())
+            sources.append(path)
+
+    notice = None
+    if len(sources) > podcast_config.MAX_PAPERS:
+        notice = f"Only the first {podcast_config.MAX_PAPERS} papers are used."
+        sources = sources[:podcast_config.MAX_PAPERS]
+    set_notice("warning", notice)
+
+    st.session_state.thread_id = str(uuid.uuid4())
+    st.session_state.pending_interrupt = None
+    st.session_state.result = None
+    st.session_state.audio_path = None  # new run - clear any previous episode's audio
+    st.session_state.audio_error = None
+    st.session_state.audio_notice = None
+    st.session_state.last_steps = None
+    st.session_state.job = {
+        "kind": "pipeline", "label": PIPELINE_LABEL, "new_thread": True, "upload_dir": upload_dir,
+        "input": {"input_sources": sources, "human_in_loop": st.session_state.get("hil", False)},
+    }
+
+
+def queue_resume(resume_value, label):
+    set_notice(None, None)
+    st.session_state.job = {"kind": "pipeline", "label": label, "input": Command(resume=resume_value)}
+
+
+def approve_with_edits(draft_id, draft_lines):
+    edited = [
+        {
+            "speaker": st.session_state[f"speaker_{draft_id}_{i}"],
+            "text": st.session_state[f"text_{draft_id}_{i}"],
+            "cites_paper_ids": line.get("cites_paper_ids", []),
+        }
+        for i, line in enumerate(draft_lines)
+    ]
+    queue_resume({"action": "approve", "edited_lines": edited}, "Finalizing the script...")
+
+
+def regenerate_draft(draft_id):
+    feedback = st.session_state.get(f"feedback_{draft_id}", "")
+    queue_resume({"action": "regenerate", "feedback": feedback}, "Regenerating the script...")
+
+
+def start_audio(engine, model_path, voices_path):
+    st.session_state.audio_error = None
+    st.session_state.audio_notice = None
+    set_notice(None, None)
+    st.session_state.job = {"kind": "audio", "engine": engine,
+                            "model_path": model_path, "voices_path": voices_path}
+
+
+def stop_job():
+    """Stop button callback. Streamlit then interrupts the running script."""
+    job = st.session_state.job
+    st.session_state.job = None
+    if not job:
+        return
+    if job.get("upload_dir"):
+        shutil.rmtree(job["upload_dir"], ignore_errors=True)
+    if job["kind"] == "pipeline":
+        # Show whatever the run had reached (usually nothing usable).
+        st.session_state.pending_interrupt, st.session_state.result = restore_run(st.session_state.thread_id)
+        st.session_state.last_steps = None
+        set_notice("info", "Pipeline stopped. The step that was running finishes in the background "
+                           "and its result is discarded.")
+    else:
+        # Shown next to the audio controls, where the user clicked Stop.
+        st.session_state.audio_notice = "Audio generation stopped."
+
+
+def execute_pipeline_job(job):
+    """Run (or resume) the graph with one progress line per finished step."""
+    if job.get("new_thread"):
+        st.query_params["thread"] = st.session_state.thread_id
+    steps, error = [], None
+    with st.status(job["label"], expanded=True) as status:
+        def on_step(name, secs):
+            steps.append(f"✓ {name} ({secs:.1f}s)")
+            status.write(steps[-1])  # also where a Stop click interrupts the run
         try:
-            values, payload = run_graph(
-                app, inputs_or_command, thread_config(),
-                on_step=lambda name, secs: status.write(f"✓ {name} ({secs:.1f}s)"),
-            )
+            values, payload = run_graph(app, job["input"], thread_config(), on_step=on_step)
         except Exception as e:
-            status.update(label="Pipeline failed", state="error")
-            st.error(f"Pipeline failed: {e}")
-            return False
-        # Collapse the step list once finished; it stays one click away.
-        status.update(label="Paused for review" if payload is not None else "Done",
-                      state="complete", expanded=False)
-    apply_outcome(values, payload)
-    return True
+            error = e
+    if job.get("upload_dir"):
+        # Ingestion has read the uploads by now (their text lives in the
+        # run's state), and nothing - not even a resumed review - opens them again.
+        shutil.rmtree(job["upload_dir"], ignore_errors=True)
+
+    st.session_state.job = None
+    if error is not None:
+        st.session_state.last_steps = ("Pipeline failed", steps, "error")
+        set_notice("error", f"Pipeline failed: {error}")
+    else:
+        apply_outcome(values, payload)
+        st.session_state.last_steps = ("Paused for review" if payload is not None else "Done", steps, "complete")
+    st.rerun()
+
+
+def execute_audio_job(job, script):
+    from src.tts import render_script_to_audio
+    out_path = os.path.join("outputs", f"episode_{st.session_state.thread_id}.wav")
+    total = len(script.lines)
+    bar = st.progress(0.0, text=f"Rendering audio with {job['engine']}... line 0/{total}")
+
+    def on_line(done, n):
+        bar.progress(done / n, text=f"Rendering audio with {job['engine']}... line {done}/{n}")
+
+    try:
+        render_script_to_audio(
+            script, out_path, model_path=job["model_path"], voices_path=job["voices_path"],
+            tts_engine=job["engine"], on_line=on_line,
+        )
+        st.session_state.audio_path = out_path
+        st.session_state.audio_error = None
+    except Exception as e:
+        st.session_state.audio_path = None
+        st.session_state.audio_error = str(e)
+    st.session_state.job = None
+    st.rerun()
 
 
 # ---------------------------------------------------------------------------
@@ -275,228 +414,201 @@ tab_run, tab_dashboard, tab_library = st.tabs(["🎙️ Run Pipeline", "📊 Cos
 # TAB 1: Run pipeline + human-in-the-loop review + audio generation
 # ---------------------------------------------------------------------------
 with tab_run:
+    job = st.session_state.job
+    busy = job is not None
     st.subheader("Generate a debate episode")
 
     col1, col2 = st.columns([3, 1])
     with col1:
-        papers_input = st.text_input(
-            "arXiv IDs (comma-separated)", placeholder="2306.07691, 2310.06825"
-        )
-        uploaded_files = st.file_uploader("Or upload PDF files", type=["pdf"], accept_multiple_files=True)
+        st.text_input("arXiv IDs (comma-separated)", placeholder="2306.07691, 2310.06825",
+                      key="papers_input", disabled=busy)
+        st.file_uploader("Or upload PDF files", type=["pdf"], accept_multiple_files=True,
+                         key="uploads", disabled=busy)
     with col2:
-        human_in_loop = st.toggle(
-            "Human-in-the-loop review",
-            value=False,
+        st.toggle(
+            "Human-in-the-loop review", value=False, key="hil", disabled=busy,
             help="When ON, the pipeline pauses before finalizing so you can edit, "
             "approve or regenerate the script here. When OFF, it runs straight through unattended.",
         )
 
-    if st.button("Run Pipeline", type="primary", disabled=not (papers_input.strip() or uploaded_files)):
-        arxiv_ids = [p.strip() for p in papers_input.split(",") if p.strip()]
-        pdf_entries = [p for p in arxiv_ids if p.lower().endswith(".pdf")]
-        if pdf_entries:
-            # Typed paths would make the server read arbitrary local files.
-            st.error(f"'{pdf_entries[0]}' looks like a PDF path. Paths can't be typed here - "
-                     "upload the file with the uploader below instead.")
-        else:
-            input_sources = list(arxiv_ids)
-            upload_dir = None
-            if uploaded_files:
-                # A fresh folder per run, so same-named uploads never collide.
-                upload_dir = tempfile.mkdtemp(prefix="papercast_")
-                for i, uploaded_file in enumerate(uploaded_files):
-                    safe_name = f"{i}_{os.path.basename(uploaded_file.name)}"
-                    temp_path = os.path.join(upload_dir, safe_name)
-                    with open(temp_path, "wb") as f:
-                        f.write(uploaded_file.getbuffer())
-                    input_sources.append(temp_path)
-            if len(input_sources) > podcast_config.MAX_PAPERS:
-                st.warning(f"Only the first {podcast_config.MAX_PAPERS} papers are used.")
-                input_sources = input_sources[:podcast_config.MAX_PAPERS]
+    has_input = bool(st.session_state.get("papers_input", "").strip() or st.session_state.get("uploads"))
+    run_col, stop_col, _ = st.columns([1.6, 1.1, 4])
+    run_col.button("▶️ Run Pipeline", type="primary", disabled=busy or not has_input,
+                   on_click=start_pipeline, width="stretch")
+    if busy and job["kind"] == "pipeline":
+        stop_col.button("⏹️ Stop", on_click=stop_job, width="stretch",
+                        help="Stops after the step in progress finishes.")
 
-            st.session_state.thread_id = str(uuid.uuid4())
-            st.query_params["thread"] = st.session_state.thread_id
-            st.session_state.audio_path = None  # new run - clear any previous episode's audio
-            st.session_state.audio_error = None
-            st.session_state.pending_interrupt = None
-            st.session_state.result = None
-            try:
-                run_with_progress(
-                    {"input_sources": input_sources, "human_in_loop": human_in_loop},
-                    "Running: ingest → academic → grounding → rag → skeptic → host → script check",
+    # Fixed slots, so nothing below shifts position between runs.
+    notice_slot = st.container()
+    progress_slot = st.container()
+    # While a pipeline job runs this stays empty, which also clears the
+    # previous review/result at once instead of leaving it on screen (and
+    # clickable) until the run ends.
+    body = st.empty()
+
+    if st.session_state.notice:
+        kind, text = st.session_state.notice
+        getattr(notice_slot, kind)(text)
+
+    if busy and job["kind"] == "pipeline":
+        with progress_slot:
+            execute_pipeline_job(job)  # reruns the page when done
+
+    if st.session_state.last_steps:
+        label, steps, state = st.session_state.last_steps
+        with progress_slot.status(label, state=state, expanded=False):
+            for line in steps:
+                st.write(line)
+
+    with body.container():
+        # --- Human review UI (only shown when the graph is actually paused) ---
+        if st.session_state.pending_interrupt:
+            payload = st.session_state.pending_interrupt
+            papers = run_papers()
+            st.divider()
+            st.subheader("⏸️ Review the draft")
+            st.caption("Edit any line, then approve - or tell the Host what to change and regenerate.")
+
+            gr = payload["grounding_report"]
+            script_flags = payload.get("script_grounding_report", {}).get("flagged_lines", [])
+            flags_by_line = {f["index"]: f for f in script_flags}
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Quotes verified", f"{gr['verified_citations']}/{gr['total_citations']}",
+                      help="Academic's quotes found in the source text")
+            c2.metric("Unverified quotes", gr["hallucinated_citations"])
+            c3.metric("Script lines flagged", len(script_flags),
+                      help="Lines citing an unknown paper, or a number not found in the cited paper")
+            if gr["flagged"]:
+                with st.expander(f"⚠️ {len(gr['flagged'])} quote(s) could not be found in the source paper"):
+                    for f in gr["flagged"]:
+                        st.markdown(
+                            f"{ref_chips([f['paper_id']], papers)} \"{html.escape(f['quote'])}\" "
+                            f'<span class="pc-muted">match {f["match_score"]:.2f}</span>',
+                            unsafe_allow_html=True,
+                        )
+
+            if papers:
+                st.markdown("**Sources** <span class='pc-muted'>(hover a number for details)</span>",
+                            unsafe_allow_html=True)
+                render_sources(papers)
+
+            # Widget keys include a hash of the draft, so a regenerated draft gets
+            # fresh editors instead of inheriting the previous draft's edits.
+            draft_lines = payload["draft_script"]
+            draft_id = hashlib.md5(json.dumps(draft_lines, sort_keys=True).encode()).hexdigest()[:8]
+
+            st.markdown("**Script**")
+            for i, line in enumerate(draft_lines):
+                cols = st.columns([1.5, 5])
+                cols[0].selectbox(
+                    "Speaker", list(SPEAKERS),
+                    index=list(SPEAKERS).index(line["speaker"]),
+                    key=f"speaker_{draft_id}_{i}", label_visibility="collapsed",
+                    format_func=lambda s: f"{SPEAKERS[s][0]} {s}", disabled=busy,
                 )
-            finally:
-                # Ingestion has read the uploads by now (their text lives in
-                # the run's state), and nothing - not even a resumed review -
-                # opens the files again.
-                if upload_dir:
-                    shutil.rmtree(upload_dir, ignore_errors=True)
+                cols[1].text_area(
+                    "Line", value=line["text"], key=f"text_{draft_id}_{i}",
+                    label_visibility="collapsed", height=68, disabled=busy,
+                )
+                cites = line.get("cites_paper_ids", [])
+                notes = []
+                if cites:
+                    notes.append(f'<span class="pc-muted">cites</span>{ref_chips(cites, papers)}')
+                if i in flags_by_line:
+                    reasons = with_numbers("; ".join(flags_by_line[i]["reasons"]), papers)
+                    notes.append(f'<span class="pc-flag">⚠️ {html.escape(reasons)}</span>')
+                if notes:
+                    cols[1].markdown(" &nbsp; ".join(notes), unsafe_allow_html=True)
 
-    # --- Human review UI (only shown when the graph is actually paused) ---
-    if st.session_state.pending_interrupt:
-        payload = st.session_state.pending_interrupt
-        papers = run_papers()
-        st.divider()
-        st.subheader("⏸️ Review the draft")
-        st.caption("Edit any line, then approve - or tell the Host what to change and regenerate.")
+            col_a, col_o = st.columns(2)
+            col_a.button("✅ Approve (with my edits)", type="primary", disabled=busy,
+                         on_click=approve_with_edits, args=(draft_id, draft_lines))
+            col_o.button("📄 Approve original draft", disabled=busy,
+                         on_click=queue_resume, args=({"action": "approve"}, "Finalizing the script..."))
 
-        gr = payload["grounding_report"]
-        script_flags = payload.get("script_grounding_report", {}).get("flagged_lines", [])
-        flags_by_line = {f["index"]: f for f in script_flags}
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Quotes verified", f"{gr['verified_citations']}/{gr['total_citations']}",
-                  help="Academic's quotes found in the source text")
-        c2.metric("Unverified quotes", gr["hallucinated_citations"])
-        c3.metric("Script lines flagged", len(script_flags),
-                  help="Lines citing an unknown paper, or a number not found in the cited paper")
-        if gr["flagged"]:
-            with st.expander(f"⚠️ {len(gr['flagged'])} quote(s) could not be found in the source paper"):
-                for f in gr["flagged"]:
-                    st.markdown(
-                        f"{ref_chips([f['paper_id']], papers)} \"{html.escape(f['quote'])}\" "
-                        f'<span class="pc-muted">match {f["match_score"]:.2f}</span>',
-                        unsafe_allow_html=True,
-                    )
-
-        if papers:
-            st.markdown("**Sources** <span class='pc-muted'>(hover a number for details)</span>",
-                        unsafe_allow_html=True)
-            render_sources(papers)
-
-        # Widget keys include a hash of the draft, so a regenerated draft gets
-        # fresh editors instead of inheriting the previous draft's edits.
-        draft_id = hashlib.md5(json.dumps(payload["draft_script"], sort_keys=True).encode()).hexdigest()[:8]
-
-        st.markdown("**Script**")
-        edited_lines = []
-        for i, line in enumerate(payload["draft_script"]):
-            cols = st.columns([1.5, 5])
-            speaker = cols[0].selectbox(
-                "Speaker", list(SPEAKERS),
-                index=list(SPEAKERS).index(line["speaker"]),
-                key=f"speaker_{draft_id}_{i}", label_visibility="collapsed",
-                format_func=lambda s: f"{SPEAKERS[s][0]} {s}",
+            st.markdown("**Not happy with the draft?** Tell the Host what to change:")
+            st.text_area(
+                "Feedback for the Host", key=f"feedback_{draft_id}", label_visibility="collapsed",
+                placeholder="e.g. Make the Skeptic push harder on the sample size.", disabled=busy,
             )
-            text = cols[1].text_area(
-                "Line", value=line["text"], key=f"text_{draft_id}_{i}",
-                label_visibility="collapsed", height=68,
+            st.button("🔁 Regenerate", disabled=busy, on_click=regenerate_draft, args=(draft_id,))
+
+        # --- Final result ---
+        if st.session_state.result:
+            result = st.session_state.result
+            papers = result.get("papers", [])
+            script_report = result.get("script_grounding_report") or {}
+            script_flags = script_report.get("flagged_lines", [])
+            st.divider()
+            st.subheader("🎬 Final script")
+
+            total_cost = sum(r.estimated_cost_usd for r in result["run_log"])
+            total_time = sum(r.duration_s for r in result["run_log"])
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Cost (this run)", f"${total_cost:.4f}")
+            m2.metric("Time (this run)", f"{total_time:.1f}s")
+            m3.metric("Quotes verified", f"{result['grounding_report']['grounding_rate']:.0%}")
+            m4.metric("Script lines flagged", len(script_flags))
+
+            if papers:
+                st.markdown("**Sources** <span class='pc-muted'>(hover a number for details)</span>",
+                            unsafe_allow_html=True)
+                render_sources(papers)
+            render_script(result["final_script"].lines, papers, {f["index"]: f for f in script_flags})
+
+            # --- Transcript downloads ---
+            export_args = (
+                result["final_script"], result["papers"],
+                result.get("grounding_report"), result.get("script_grounding_report"),
             )
-            cites = line.get("cites_paper_ids", [])
-            notes = []
-            if cites:
-                notes.append(f'<span class="pc-muted">cites</span>{ref_chips(cites, papers)}')
-            if i in flags_by_line:
-                reasons = with_numbers("; ".join(flags_by_line[i]["reasons"]), papers)
-                notes.append(f'<span class="pc-flag">⚠️ {html.escape(reasons)}</span>')
-            if notes:
-                cols[1].markdown(" &nbsp; ".join(notes), unsafe_allow_html=True)
-            edited_lines.append({"speaker": speaker, "text": text, "cites_paper_ids": cites})
-
-        col_a, col_o = st.columns(2)
-        approve_edited = col_a.button("✅ Approve (with my edits)", type="primary")
-        approve_original = col_o.button("📄 Approve original draft")
-
-        st.markdown("**Not happy with the draft?** Tell the Host what to change:")
-        feedback = st.text_area(
-            "Feedback for the Host", key=f"feedback_{draft_id}", label_visibility="collapsed",
-            placeholder="e.g. Make the Skeptic push harder on the sample size.",
-        )
-        regenerate = st.button("🔁 Regenerate")
-
-        resume_value = None
-        if approve_edited:
-            resume_value = {"action": "approve", "edited_lines": edited_lines}
-        elif approve_original:
-            resume_value = {"action": "approve"}
-        elif regenerate:
-            resume_value = {"action": "regenerate", "feedback": feedback}
-        if resume_value is not None:
-            if run_with_progress(Command(resume=resume_value), "Resuming..."):
-                st.rerun()
-
-    # --- Final result ---
-    if st.session_state.result:
-        result = st.session_state.result
-        papers = result.get("papers", [])
-        script_report = result.get("script_grounding_report") or {}
-        script_flags = script_report.get("flagged_lines", [])
-        st.divider()
-        st.subheader("🎬 Final script")
-
-        total_cost = sum(r.estimated_cost_usd for r in result["run_log"])
-        total_time = sum(r.duration_s for r in result["run_log"])
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Cost (this run)", f"${total_cost:.4f}")
-        m2.metric("Time (this run)", f"{total_time:.1f}s")
-        m3.metric("Quotes verified", f"{result['grounding_report']['grounding_rate']:.0%}")
-        m4.metric("Script lines flagged", len(script_flags))
-
-        if papers:
-            st.markdown("**Sources** <span class='pc-muted'>(hover a number for details)</span>",
-                        unsafe_allow_html=True)
-            render_sources(papers)
-        render_script(result["final_script"].lines, papers, {f["index"]: f for f in script_flags})
-
-        # --- Transcript downloads ---
-        export_args = (
-            result["final_script"], result["papers"],
-            result.get("grounding_report"), result.get("script_grounding_report"),
-        )
-        d1, d2, _ = st.columns([1, 1, 2])
-        d1.download_button(
-            "⬇️ Transcript (.md)", data=script_to_markdown(*export_args),
-            file_name="transcript.md", mime="text/markdown",
-        )
-        d2.download_button(
-            "⬇️ Transcript (.json)", data=script_to_json(*export_args),
-            file_name="transcript.json", mime="application/json",
-        )
-
-        # --- Audio generation ---
-        st.divider()
-        st.subheader("🔊 Audio Episode")
-
-        files_ready = True
-        if tts_engine == "kokoro":
-            files_ready = os.path.exists(model_path) and os.path.exists(voices_path)
-
-        gen_col, status_col = st.columns([1, 3])
-        with gen_col:
-            generate_clicked = st.button(
-                "🎧 Generate Audio", disabled=not files_ready, type="primary"
+            d1, d2, _ = st.columns([1, 1, 2])
+            d1.download_button(
+                "⬇️ Transcript (.md)", data=script_to_markdown(*export_args),
+                file_name="transcript.md", mime="text/markdown",
             )
-        with status_col:
+            d2.download_button(
+                "⬇️ Transcript (.json)", data=script_to_json(*export_args),
+                file_name="transcript.json", mime="application/json",
+            )
+
+            # --- Audio generation ---
+            st.divider()
+            st.subheader("🔊 Audio Episode")
+
+            files_ready = True
+            if tts_engine == "kokoro":
+                files_ready = os.path.exists(model_path) and os.path.exists(voices_path)
+
+            gen_col, stop_audio_col, _ = st.columns([1.3, 1, 3.7])
+            gen_col.button(
+                "🎧 Generate Audio", type="primary", disabled=busy or not files_ready, width="stretch",
+                on_click=start_audio, args=(tts_engine, model_path, voices_path),
+            )
+            audio_running = busy and job["kind"] == "audio"
+            if audio_running:
+                stop_audio_col.button("⏹️ Stop", key="stop_audio", on_click=stop_job, width="stretch",
+                                      help="Stops after the line in progress finishes.")
             if not files_ready:
                 st.caption("⚠️ Model files not found - see sidebar / README to download them first.")
 
-        if generate_clicked:
-            from src.tts import render_script_to_audio
-            out_path = os.path.join("outputs", f"episode_{st.session_state.thread_id}.wav")
-            with st.spinner(f"Rendering audio with {tts_engine}... (a few seconds per line)"):
-                try:
-                    render_script_to_audio(
-                        result["final_script"], out_path,
-                        model_path=model_path, voices_path=voices_path,
-                        tts_engine=tts_engine
-                    )
-                    st.session_state.audio_path = out_path
-                    st.session_state.audio_error = None
-                except Exception as e:
-                    st.session_state.audio_path = None
-                    st.session_state.audio_error = str(e)
+            if audio_running:
+                execute_audio_job(job, result["final_script"])  # reruns the page when done
 
-        if st.session_state.audio_error:
-            st.error(f"Audio generation failed: {st.session_state.audio_error}")
+            if st.session_state.audio_notice:
+                st.info(st.session_state.audio_notice)
+            if st.session_state.audio_error:
+                st.error(f"Audio generation failed: {st.session_state.audio_error}")
 
-        if st.session_state.audio_path and os.path.exists(st.session_state.audio_path):
-            st.success(f"Episode ready: `{st.session_state.audio_path}`")
-            with open(st.session_state.audio_path, "rb") as f:
-                audio_bytes = f.read()
-            st.audio(audio_bytes, format="audio/wav")
-            st.download_button(
-                "⬇️ Download .wav", data=audio_bytes,
-                file_name=os.path.basename(st.session_state.audio_path), mime="audio/wav",
-            )
+            if st.session_state.audio_path and os.path.exists(st.session_state.audio_path):
+                st.success(f"Episode ready: `{st.session_state.audio_path}`")
+                with open(st.session_state.audio_path, "rb") as f:
+                    audio_bytes = f.read()
+                st.audio(audio_bytes, format="audio/wav")
+                st.download_button(
+                    "⬇️ Download .wav", data=audio_bytes,
+                    file_name=os.path.basename(st.session_state.audio_path), mime="audio/wav",
+                )
 
 # ---------------------------------------------------------------------------
 # TAB 2: Cost & latency dashboard, across ALL runs ever logged

@@ -55,12 +55,19 @@ def render_script_to_audio(
     output_path: str,
     model_path: str = "kokoro-v1.0.int8.onnx",
     voices_path: str = "voices-v1.0.bin",
-    tts_engine: str = "kokoro"
+    tts_engine: str = "kokoro",
+    on_line=None,
 ) -> str:
     """
     Renders every line in `script` to speech and concatenates into one file
     at `output_path` (.wav or .mp3 depending on engine). Returns the output path.
+
+    `on_line(done, total)`, if given, is called after each line - the
+    dashboard uses it for a progress bar, which is also where a Stop click
+    can interrupt the render. The output file is only written at the end,
+    so a stopped render never leaves a partial episode behind.
     """
+    total = len(script.lines)
     if not script.lines:
         raise ValueError("script.lines is empty - nothing to render.")
 
@@ -80,10 +87,15 @@ def render_script_to_audio(
                 voice = VOICE_MAP_EDGE.get(line.speaker, "en-US-AriaNeural")
                 communicate = edge_tts.Communicate(line.text, voice)
                 temp_mp3 = f"{output_path}_temp_{i}.mp3"
-                await communicate.save(temp_mp3)
-                segment = AudioSegment.from_mp3(temp_mp3)
+                try:
+                    await communicate.save(temp_mp3)
+                    segment = AudioSegment.from_mp3(temp_mp3)
+                finally:
+                    if os.path.exists(temp_mp3):
+                        os.remove(temp_mp3)
                 combined += segment + silence
-                os.remove(temp_mp3)
+                if on_line:
+                    on_line(i + 1, total)
             
             # Export as wav since dashboard expects wav
             combined.export(output_path, format="wav")
@@ -111,14 +123,15 @@ def render_script_to_audio(
             samples, sr = kokoro.create(line.text, voice=voice, speed=1.0, lang="en-us", trim=False)
         except Exception as e:
             print(f"[tts] WARNING: failed to render line {i} ({line.speaker}): {e}")
-            continue
+            samples = []
 
         if len(samples) == 0:
             print(f"[tts] WARNING: 0 samples produced for line {i} ({line.speaker}): {line.text[:50]!r}")
-            continue
-
-        segments.append(samples)
-        segments.append(silence)
+        else:
+            segments.append(samples)
+            segments.append(silence)
+        if on_line:
+            on_line(i + 1, total)
 
     if not segments:
         raise ValueError("No audio was generated for any line - check the model files are valid.")
