@@ -1,6 +1,6 @@
 # PaperCast: AI Podcast Debate Generator
 
-🚀 **[Live Demo](https://papercast-parth.streamlit.app/)** | 👤 **[GitHub Profile](https://github.com/parthdeuri)**
+🚀 **[Live Demo](https://papercast-parth.streamlit.app/)**
 
 Turns 1-3 research papers (via arXiv IDs or local PDF uploads) into a debate-style podcast script between three
 personas (Academic, Skeptic, Host), with citation grounding to catch hallucinated quotes, an optional human-in-the-loop review step, and a cost/latency dashboard.
