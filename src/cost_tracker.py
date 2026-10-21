@@ -64,7 +64,7 @@ def track_node(node_name: str, run_log: list, model: str = config.MODEL_NAME):
 def _persist(entry: NodeRunLog):
     import os
     os.makedirs(config.LOG_DIR, exist_ok=True)
-    with open(config.RUN_LOG_PATH, "a") as f:
+    with open(config.RUN_LOG_PATH, "a", encoding="utf-8") as f:
         f.write(entry.model_dump_json() + "\n")
 
 
@@ -74,7 +74,7 @@ def load_all_runs() -> list:
     if not os.path.exists(config.RUN_LOG_PATH):
         return []
     entries = []
-    with open(config.RUN_LOG_PATH) as f:
+    with open(config.RUN_LOG_PATH, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if line:

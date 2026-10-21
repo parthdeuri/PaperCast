@@ -77,14 +77,14 @@ permanent free tier - only occasional, non-guaranteed trial credits.
 
 ```bash
 # unattended run, no review pause
-python -m src.main --papers 2306.07691 2310.06825 --no-human-in-loop
+python -m src.main --inputs 2306.07691 2310.06825 --no-human-in-loop
 
 # with human review pause (prompts in terminal)
-python -m src.main --papers 2306.07691 --human-in-loop
+python -m src.main --inputs 2306.07691 --human-in-loop
 
 # generate an audio episode too (Kokoro TTS via kokoro-onnx, free, local,
 # works on Python 3.10-3.13)
-python -m src.main --papers 2306.07691 --no-human-in-loop --audio outputs/episode.wav
+python -m src.main --inputs 2306.07691 --no-human-in-loop --audio outputs/episode.wav
 ```
 
 Audio generation needs the `kokoro-onnx` package (already in

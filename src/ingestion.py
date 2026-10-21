@@ -36,7 +36,20 @@ except ImportError:  # pragma: no cover
 
 
 class IngestionError(Exception):
+    """A permanent failure (bad ID, paper not found) - retrying won't help."""
     pass
+
+
+class TransientIngestionError(IngestionError):
+    """A failure that may succeed on retry (rate limit, network, server error)."""
+    pass
+
+
+# New-style IDs (2306.07691, 2306.07691v2) and old-style IDs (hep-th/9901001,
+# math.GT/0309136v1).
+_ARXIV_ID_RE = re.compile(
+    r"^(\d{4}\.\d{4,5}|[a-z][a-z\-]*(\.[A-Z]{2})?/\d{7})(v\d+)?$"
+)
 
 
 class PDFMetadata(BaseModel):
@@ -56,20 +69,30 @@ ARXIV_CLIENT = arxiv.Client(delay_seconds=5, num_retries=3) if arxiv else None
 @retry(
     stop=stop_after_attempt(4),
     wait=wait_exponential(multiplier=2, min=10, max=90),  # arXiv 429s need real cooldown
-    retry=retry_if_exception_type((IngestionError, ConnectionError, TimeoutError)),
+    # Only retry failures that might go away. A bad or unknown ID fails
+    # immediately instead of waiting through ~1 minute of backoff.
+    retry=retry_if_exception_type((TransientIngestionError, ConnectionError, TimeoutError)),
     reraise=True,
 )
 def _fetch_arxiv_result(arxiv_id: str):
     if arxiv is None:
         raise IngestionError("`arxiv` package not installed")
+    if not _ARXIV_ID_RE.match(arxiv_id):
+        hint = " (looks like a PDF path, but no such file exists)" if arxiv_id.lower().endswith(".pdf") else ""
+        raise IngestionError(f"'{arxiv_id}' is not a valid arXiv ID{hint}")
     search = arxiv.Search(id_list=[arxiv_id])
     client = ARXIV_CLIENT
     try:
         result = next(client.results(search))
     except StopIteration:
         raise IngestionError(f"No paper found for arxiv id '{arxiv_id}'")
+    except arxiv.HTTPError as e:
+        # 4xx (except 429 rate limiting) means the request itself is bad.
+        if 400 <= e.status < 500 and e.status != 429:
+            raise IngestionError(f"arxiv rejected '{arxiv_id}' (HTTP {e.status})")
+        raise TransientIngestionError(f"arxiv API error for '{arxiv_id}': {e}")
     except Exception as e:
-        raise IngestionError(f"arxiv API error for '{arxiv_id}': {e}")
+        raise TransientIngestionError(f"arxiv API error for '{arxiv_id}': {e}")
     return result
 
 

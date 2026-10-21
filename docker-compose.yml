@@ -1,12 +1,17 @@
-version: '3.8'
-
 services:
   app:
     build: .
     ports:
       - "8501:8501"
     volumes:
-      - .:/app
+      # Mount only the code (for live edits) and the runtime data folders.
+      # Mounting the whole project over /app would hide the Kokoro model
+      # files the Dockerfile downloads into /app.
+      - ./src:/app/src
+      - ./dashboard:/app/dashboard
+      - ./chroma_db:/app/chroma_db
+      - ./logs:/app/logs
+      - ./outputs:/app/outputs
     environment:
       - PODCAST_PROVIDER=${PODCAST_PROVIDER:-gemini}
       - PODCAST_MODEL=${PODCAST_MODEL:-gemini-2.5-flash}

@@ -1,0 +1,30 @@
+# Secrets - pass keys in at runtime (docker-compose reads them from .env)
+.env
+.env.*
+!.env.example
+
+# Local data, created at runtime and mounted as volumes instead
+chroma_db/
+logs/
+outputs/
+*.wav
+*.mp3
+*.pdf
+
+# Kokoro model files - the Dockerfile downloads its own copy
+*.onnx
+*.bin
+
+# Git, Python caches, virtual environments, editors
+.git/
+.gitignore
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+env/
+.vscode/
+.idea/
+.claude/
+.DS_Store
+Thumbs.db
