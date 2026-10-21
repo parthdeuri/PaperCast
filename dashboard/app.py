@@ -141,6 +141,8 @@ def set_notice(kind, text):
 
 def start_pipeline():
     """Run button callback: validate the inputs, then queue the run."""
+    if st.session_state.job:
+        return
     ids = [p.strip() for p in st.session_state.get("papers_input", "").split(",") if p.strip()]
     pdf_entries = [p for p in ids if p.lower().endswith(".pdf")]
     if pdf_entries:
@@ -181,6 +183,8 @@ def start_pipeline():
 
 
 def queue_resume(resume_value, label):
+    if st.session_state.job:
+        return
     set_notice(None, None)
     st.session_state.job = {"kind": "pipeline", "label": label, "input": Command(resume=resume_value)}
 
@@ -203,6 +207,8 @@ def regenerate_draft(draft_id):
 
 
 def start_audio(engine, model_path, voices_path):
+    if st.session_state.job:
+        return
     st.session_state.audio_error = None
     st.session_state.audio_notice = None
     set_notice(None, None)
@@ -257,11 +263,16 @@ def execute_pipeline_job(job):
     st.rerun()
 
 
-def execute_audio_job(job, script):
+def execute_audio_job(job, script, slot):
+    """Render the episode, showing progress in `slot` (an st.empty()). Putting
+    a single element into that placeholder replaces whatever it held before -
+    the previous episode's player, download button or messages - straight
+    away, instead of leaving them on screen (stale, but still clickable)
+    until the render finishes."""
     from src.tts import render_script_to_audio
     out_path = os.path.join("outputs", f"episode_{st.session_state.thread_id}.wav")
     total = len(script.lines)
-    bar = st.progress(0.0, text=f"Rendering audio with {job['engine']}... line 0/{total}")
+    bar = slot.progress(0.0, text=f"Rendering audio with {job['engine']}... line 0/{total}")
 
     def on_line(done, n):
         bar.progress(done / n, text=f"Rendering audio with {job['engine']}... line {done}/{n}")
@@ -385,15 +396,17 @@ with st.sidebar:
 
     st.divider()
     st.subheader("🔊 Audio Generation")
-    tts_engine = st.selectbox("TTS Engine", ["edge_tts", "kokoro"])
+    tts_engine = st.selectbox("TTS Engine", ["edge_tts", "kokoro"], disabled=st.session_state.job is not None)
 
     model_path = None
     voices_path = None
 
     if tts_engine == "kokoro":
         st.caption("Kokoro Model Files (for offline TTS)")
-        model_path = st.text_input("kokoro model path", value="kokoro-v1.0.int8.onnx", key="model_path_input")
-        voices_path = st.text_input("voices path", value="voices-v1.0.bin", key="voices_path_input")
+        model_path = st.text_input("kokoro model path", value="kokoro-v1.0.int8.onnx", key="model_path_input",
+                                   disabled=st.session_state.job is not None)
+        voices_path = st.text_input("voices path", value="voices-v1.0.bin", key="voices_path_input",
+                                    disabled=st.session_state.job is not None)
 
     if tts_engine == "kokoro":
         if os.path.exists(model_path) and os.path.exists(voices_path):
@@ -565,11 +578,11 @@ with tab_run:
             d1, d2, _ = st.columns([1, 1, 2])
             d1.download_button(
                 "⬇️ Transcript (.md)", data=script_to_markdown(*export_args),
-                file_name="transcript.md", mime="text/markdown",
+                file_name="transcript.md", mime="text/markdown", on_click="ignore",
             )
             d2.download_button(
                 "⬇️ Transcript (.json)", data=script_to_json(*export_args),
-                file_name="transcript.json", mime="application/json",
+                file_name="transcript.json", mime="application/json", on_click="ignore",
             )
 
             # --- Audio generation ---
@@ -592,23 +605,25 @@ with tab_run:
             if not files_ready:
                 st.caption("⚠️ Model files not found - see sidebar / README to download them first.")
 
+            audio_out = st.empty()
             if audio_running:
-                execute_audio_job(job, result["final_script"])  # reruns the page when done
+                execute_audio_job(job, result["final_script"], audio_out)  # reruns the page when done
 
-            if st.session_state.audio_notice:
-                st.info(st.session_state.audio_notice)
-            if st.session_state.audio_error:
-                st.error(f"Audio generation failed: {st.session_state.audio_error}")
+            with audio_out.container():
+                if st.session_state.audio_notice:
+                    st.info(st.session_state.audio_notice)
+                if st.session_state.audio_error:
+                    st.error(f"Audio generation failed: {st.session_state.audio_error}")
 
-            if st.session_state.audio_path and os.path.exists(st.session_state.audio_path):
-                st.success(f"Episode ready: `{st.session_state.audio_path}`")
-                with open(st.session_state.audio_path, "rb") as f:
-                    audio_bytes = f.read()
-                st.audio(audio_bytes, format="audio/wav")
-                st.download_button(
-                    "⬇️ Download .wav", data=audio_bytes,
-                    file_name=os.path.basename(st.session_state.audio_path), mime="audio/wav",
-                )
+                if st.session_state.audio_path and os.path.exists(st.session_state.audio_path):
+                    st.success(f"Episode ready: `{st.session_state.audio_path}`")
+                    with open(st.session_state.audio_path, "rb") as f:
+                        audio_bytes = f.read()
+                    st.audio(audio_bytes, format="audio/wav")
+                    st.download_button(
+                        "⬇️ Download .wav", data=audio_bytes, on_click="ignore",
+                        file_name=os.path.basename(st.session_state.audio_path), mime="audio/wav",
+                    )
 
 # ---------------------------------------------------------------------------
 # TAB 2: Cost & latency dashboard, across ALL runs ever logged
@@ -676,7 +691,7 @@ with tab_library:
                 f'<span class="pc-muted" title="{html.escape(paper["id"])}">{html.escape(origin)}</span>',
                 unsafe_allow_html=True,
             )
-            if col2.button("Delete", key=f"del_{paper['id']}"):
+            if col2.button("Delete", key=f"del_{paper['id']}", disabled=st.session_state.job is not None):
                 if delete_from_library(paper['id']):
                     st.success(f"Deleted {paper['id']}")
                     st.rerun()
@@ -684,7 +699,7 @@ with tab_library:
                     st.error("Failed to delete paper.")
                     
         st.divider()
-        if st.button("🗑️ Clear Entire Library", type="primary"):
+        if st.button("🗑️ Clear Entire Library", type="primary", disabled=st.session_state.job is not None):
             if clear_library():
                 st.success("Library cleared.")
                 st.rerun()
