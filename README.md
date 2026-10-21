@@ -8,11 +8,13 @@ personas (Academic, Skeptic, Host), with citation grounding to catch hallucinate
 ## Architecture
 
 ```
-ingest → academic_agent → grounding → rag_lookup → skeptic_agent → host_agent → review → (finalize)
-         (per paper,        (verifies    (cross-refs   (critiques,    (writes the   ^
-          1-3 papers)        citations    against local  incl. cross-   debate         |
-                              against      library + live paper +       script)      +-- optional pause here,
-                              source)      arxiv search)  external lit)                  toggled by human_in_loop
+ingest → academic_agent → grounding → rag_lookup → skeptic_agent → host_agent → script_grounding → review → (finalize)
+ (1-3     (per paper)      (verifies    (cross-refs    (critiques,    (writes the   (flags unknown       (optional pause,
+ papers)                    citations    against local  incl. cross-   debate        paper IDs and        toggled by
+                            against      library + live paper +       script)       unsupported          human_in_loop)
+                            source)      arxiv search)  external lit)                numbers)                 |
+                                                                          ^                                   |
+                                                                          +---- "regenerate" with feedback ---+
 ```
 
 The **RAG layer** (`rag_lookup`) queries two sources per paper: a persistent
@@ -44,16 +46,24 @@ review/dashboard UI.
 - **Graceful degradation on ingestion.** A paper whose PDF can't be parsed
   cleanly (scanned images, weird layout) falls back to abstract-only mode
   rather than crashing or silently passing empty text into an agent.
+- **The Host's script is checked too.** `script_grounding` (also plain
+  string logic, `src/script_grounding.py`) flags lines that cite a paper
+  that isn't in the run, or state a number that doesn't appear in the cited
+  paper's text. It only flags - the reviewer decides.
 - **Human-in-the-loop is optional and toggleable**, implemented via
-  LangGraph's `interrupt()`/`Command(resume=...)` primitives with a
-  `MemorySaver` checkpointer. When off, `review_node` passes straight
-  through - useful for scheduled/unattended runs.
+  LangGraph's `interrupt()`/`Command(resume=...)` primitives. The reviewer
+  can approve (with edits) or **regenerate** with feedback, which sends the
+  graph back to the Host. When off, `review_node` passes straight through -
+  useful for scheduled/unattended runs. The CLI uses an in-memory
+  checkpointer; the dashboard uses SQLite (`checkpoints.sqlite`), so a paused
+  review survives a page refresh or restart.
 - **Cost/latency tracked per node**, not just per run, and persisted to
   `logs/run_log.jsonl` across every run so the dashboard shows trends, not
   just a single execution's numbers.
 - **MOCK_MODE** lets you exercise the entire graph - ingestion, grounding,
-  cost tracking, HITL pause/resume - without an API key or spending money.
-  This is how the graph wiring itself was verified during development.
+  cost tracking, HITL pause/resume - without an LLM API key or spending
+  money. It replaces only the LLM calls: fetching papers from arXiv and the
+  RAG embedding model still need internet (the test suite stubs both).
 
 ## Setup
 
@@ -85,7 +95,14 @@ python -m src.main --inputs 2306.07691 --human-in-loop
 # generate an audio episode too (Kokoro TTS via kokoro-onnx, free, local,
 # works on Python 3.10-3.13)
 python -m src.main --inputs 2306.07691 --no-human-in-loop --audio outputs/episode.wav
+
+# save the transcript; the format follows the extension (.md or .json)
+python -m src.main --inputs 2306.07691 --no-human-in-loop --transcript outputs/episode.md
 ```
+
+The CLI prints a line as each pipeline step finishes. Fetched arXiv papers
+are cached under `cache/arxiv/`, so re-running the same paper skips the
+download (delete that folder to force a fresh fetch).
 
 Audio generation needs the `kokoro-onnx` package (already in
 `requirements.txt`) plus **two model files you download once manually**
@@ -114,14 +131,20 @@ player) - see `convert_wav_to_mp3()` in `src/tts.py` if you want an actual
 streamlit run dashboard/app.py
 ```
 
-Two tabs:
-- **Run Pipeline** - enter arXiv IDs, toggle human-in-the-loop on/off, run.
-  If paused, edit lines inline and approve. Once a final script exists, a
+Three tabs:
+- **Run Pipeline** - enter arXiv IDs (or upload PDFs), toggle
+  human-in-the-loop on/off, run; progress shows step by step. If paused, the
+  script lines flagged by the script check are highlighted; edit lines
+  inline and approve, approve the original draft, or regenerate with
+  feedback. Refreshing the page while paused restores the review. Once a
+  final script exists you can download the transcript (.md / .json), and a
   "Generate Audio" button renders it with Kokoro TTS and plays it inline
   (with a download button) - disabled automatically if the model files
   aren't found in the project root.
 - **Cost & Latency** - reads `logs/run_log.jsonl` across all runs ever
   executed, with per-node cost/latency bar charts and an error rate metric.
+- **Library Management** - view, delete, or clear the papers in the local
+  RAG library.
 
 The sidebar always shows the active provider/model and whether MOCK_MODE is
 on, and lets you point at custom model file paths for audio generation.
@@ -131,8 +154,9 @@ on, and lets you point at custom model file paths for audio generation.
 - **Local PDF & arXiv Support**: Multi-paper ingestion (1-3 papers) via arXiv IDs or direct PDF uploads, with retry/backoff and abstract-only fallback.
 - **Domain-Specific Heuristics**: Model determines the domain of the paper to generate specialized skeptic critiques.
 - Three-agent pipeline (Academic → Skeptic → Host) with cross-paper conflict detection.
-- **Parallelized Agent Calls**: Academic and Ingestion agents run concurrently for drastically improved speeds.
-- Citation grounding / anti-hallucination verification layer.
+- **Parallelized Agent Calls**: papers are fetched in parallel during ingestion, and the Academic agent summarizes all papers in parallel.
+- Citation grounding / anti-hallucination verification layer, plus a script check on the Host's output.
+- Review step with approve / edit / regenerate-with-feedback, and transcript export (Markdown or JSON).
 - **RAG layer**: cross-references each paper's claims against (a) a persistent
   local library of every paper this tool has processed, growing across runs,
   and (b) live arXiv search for related work never seen before. Feeds the
@@ -144,6 +168,18 @@ on, and lets you point at custom model file paths for audio generation.
 - **Flexible LLM Support**: Use Gemini, Groq, Anthropic, or any OpenAI-compatible local model (Ollama, vLLM).
 - Audio generation via **Edge TTS** (fast, cloud-based) or **Kokoro TTS** (free, local, per-persona voices).
 
+## Testing
+
+```bash
+pip install -r requirements-dev.txt
+python -m pytest -q
+```
+
+The suite runs in mock mode with arXiv and the RAG layer stubbed out, so it
+needs no network or API keys, and it writes its logs, caches and checkpoints
+into temporary folders - your real `logs/`, `chroma_db/` and `cache/` are
+never touched.
+
 ## Project layout
 
 ```
@@ -152,6 +188,8 @@ src/
   config.py             # model choice, pricing table, mock mode
   ingestion.py           # arxiv fetch + PDF extraction + fallback
   citation_grounding.py  # anti-hallucination verification
+  script_grounding.py    # checks the Host's script against the source papers
+  export.py              # transcript export (Markdown / JSON)
   cost_tracker.py        # per-node cost/latency logging
   llm_client.py          # structured-output LLM wrapper + mock mode
   graph.py               # LangGraph wiring, incl. optional HITL interrupt
@@ -166,6 +204,9 @@ src/
     host.py
 dashboard/
   app.py                 # Streamlit: run pipeline + review UI + cost charts
+tests/                   # pytest suite (mock mode, no network)
 logs/
   run_log.jsonl          # append-only cost/latency history (created on first run)
+cache/arxiv/             # cached arXiv papers (created on first run)
+checkpoints.sqlite       # dashboard run checkpoints (created on first run)
 ```

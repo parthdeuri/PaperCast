@@ -24,8 +24,10 @@ PROVIDER = os.environ.get("PODCAST_PROVIDER", "gemini")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "ollama")
-OPENAI_API_BASE = os.environ.get("OPENAI_API_BASE", "http://localhost:11434/v1")
+# `or` instead of a get() default: docker-compose passes unset variables as
+# empty strings, and an empty string should fall back to the default too.
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY") or "ollama"
+OPENAI_API_BASE = os.environ.get("OPENAI_API_BASE") or "http://localhost:11434/v1"
 
 _DEFAULT_MODELS = {
     "anthropic": "claude-sonnet-4-6",
@@ -33,7 +35,7 @@ _DEFAULT_MODELS = {
     "groq": "llama-3.3-70b-versatile",
     "openai_compatible": "llama3.1",
 }
-MODEL_NAME = os.environ.get("PODCAST_MODEL", _DEFAULT_MODELS.get(PROVIDER, "gemini-3.5-flash-lite"))
+MODEL_NAME = os.environ.get("PODCAST_MODEL") or _DEFAULT_MODELS.get(PROVIDER, "gemini-3.5-flash-lite")
 
 _KEY_BY_PROVIDER = {"anthropic": ANTHROPIC_API_KEY, "gemini": GOOGLE_API_KEY, "groq": GROQ_API_KEY, "openai_compatible": OPENAI_API_KEY}
 MOCK_MODE = os.environ.get("PODCAST_MOCK_MODE", "0") == "1" or not _KEY_BY_PROVIDER.get(PROVIDER)
@@ -61,6 +63,17 @@ PRICING_PER_MTOK = {
 # --- Logging -----------------------------------------------------------------
 LOG_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs")
 RUN_LOG_PATH = os.path.join(LOG_DIR, "run_log.jsonl")
+
+# --- Caching -----------------------------------------------------------------
+# Fetched arXiv papers are cached as JSON so re-running the same paper skips
+# the arXiv API call and the PDF download.
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ARXIV_CACHE_DIR = os.path.join(_ROOT, "cache", "arxiv")
+
+# --- Checkpoints -------------------------------------------------------------
+# SQLite file the dashboard uses for LangGraph checkpoints, so a paused
+# review survives a page refresh or a Streamlit restart.
+CHECKPOINT_DB = os.path.join(_ROOT, "checkpoints.sqlite")
 
 # --- RAG -----------------------------------------------------------------
 # Local, persistent vector store of every paper this tool has ever

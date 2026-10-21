@@ -14,10 +14,12 @@ services:
       - ./outputs:/app/outputs
     environment:
       - PODCAST_PROVIDER=${PODCAST_PROVIDER:-gemini}
-      - PODCAST_MODEL=${PODCAST_MODEL:-gemini-2.5-flash}
+      # Empty means config.py picks the provider's default model.
+      - PODCAST_MODEL=${PODCAST_MODEL:-}
       - GOOGLE_API_KEY=${GOOGLE_API_KEY}
       - GROQ_API_KEY=${GROQ_API_KEY}
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
-      - OPENAI_API_KEY=${OPENAI_API_KEY}
-      - OPENAI_API_BASE=${OPENAI_API_BASE}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-ollama}
+      # Inside the container, Ollama on the host is host.docker.internal, not localhost.
+      - OPENAI_API_BASE=${OPENAI_API_BASE:-http://host.docker.internal:11434/v1}
       - PODCAST_MOCK_MODE=${PODCAST_MOCK_MODE:-0}

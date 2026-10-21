@@ -128,3 +128,7 @@ class PipelineState(TypedDict, total=False):
     human_in_loop: bool  # toggle: whether to pause for review before finalizing
     run_log: List[NodeRunLog]
     grounding_report: dict
+    script_grounding_report: dict  # flags on the Host's script (see script_grounding.py)
+    # Set by the review node when the reviewer asks for a rewrite; the Host
+    # reads it, then clears it so the regenerate loop ends.
+    regenerate_feedback: Optional[str]

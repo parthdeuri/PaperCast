@@ -20,6 +20,7 @@ the embedding model is cached, arXiv rate limit) logs a warning and returns
 an empty result rather than raising - RAG is a pure enhancement layer, never
 a hard dependency for getting a script out of the pipeline.
 """
+import re
 import logging
 from typing import List, Optional
 
@@ -29,22 +30,73 @@ from . import config
 logger = logging.getLogger(__name__)
 
 _collection = None  # lazily-initialized Chroma collection, cached at module level
+_lazy_ef_class = None
+
+
+def _lazy_embedding_function():
+    """Chroma's SentenceTransformerEmbeddingFunction imports torch and loads
+    the model in its constructor, so merely opening the collection (e.g. to
+    list it in the dashboard) took ~45s on a cold start.
+
+    This subclass keeps the same name and config, so Chroma treats it as the
+    same embedding function the library was created with, but only loads
+    the model the first time something needs embeddings (a query or an
+    upsert). It is also registered under that name in Chroma's registry,
+    because opening a collection rebuilds the embedding function from its
+    saved config via that registry - otherwise Chroma would build the
+    eager original anyway."""
+    global _lazy_ef_class
+    if _lazy_ef_class is None:
+        from chromadb.utils.embedding_functions import (
+            SentenceTransformerEmbeddingFunction,
+            known_embedding_functions,
+        )
+
+        class LazySentenceTransformerEmbeddingFunction(SentenceTransformerEmbeddingFunction):
+            def __init__(self, model_name: str = "all-MiniLM-L6-v2", device: str = "cpu",
+                         normalize_embeddings: bool = False, **kwargs):
+                # Deliberately skips the parent __init__, which loads the model.
+                self.model_name = model_name
+                self.device = device
+                self.normalize_embeddings = normalize_embeddings
+                self.kwargs = kwargs
+
+            @property
+            def _model(self):
+                if self.model_name not in self.models:
+                    from sentence_transformers import SentenceTransformer
+                    self.models[self.model_name] = SentenceTransformer(
+                        model_name_or_path=self.model_name, device=self.device, **self.kwargs
+                    )
+                return self.models[self.model_name]
+
+            @staticmethod
+            def build_from_config(cfg):
+                return LazySentenceTransformerEmbeddingFunction(
+                    model_name=cfg["model_name"], device=cfg["device"],
+                    normalize_embeddings=cfg["normalize_embeddings"], **cfg.get("kwargs", {}),
+                )
+
+        # Same dict object Chroma reads from, so replace the entry in place.
+        known_embedding_functions[SentenceTransformerEmbeddingFunction.name()] = (
+            LazySentenceTransformerEmbeddingFunction
+        )
+        _lazy_ef_class = LazySentenceTransformerEmbeddingFunction
+
+    return _lazy_ef_class(model_name=config.EMBEDDING_MODEL)
 
 
 def _get_collection():
-    """Returns the persistent Chroma collection, creating it (and loading
-    the embedding model) on first call. Cached afterward so repeated calls
-    within one run don't reload the model."""
+    """Returns the persistent Chroma collection, creating it on first call.
+    Cached afterward. The embedding model itself loads only when a query or
+    upsert first needs it - listing or deleting papers never loads it."""
     global _collection
     if _collection is not None:
         return _collection
 
     import chromadb
-    from chromadb.utils import embedding_functions
 
-    embed_fn = embedding_functions.SentenceTransformerEmbeddingFunction(
-        model_name=config.EMBEDDING_MODEL
-    )
+    embed_fn = _lazy_embedding_function()
     client = chromadb.PersistentClient(path=config.CHROMA_DIR)
     _collection = client.get_or_create_collection(
         name="paper_library", embedding_function=embed_fn
@@ -163,9 +215,9 @@ def search_related_arxiv(paper: PaperData, top_k: int = None) -> List[RAGMatch]:
             query=paper.title, max_results=top_k + 1, sort_by=arxiv.SortCriterion.Relevance
         )
         matches = []
-        this_id = paper.paper_id.split("v")[0] if "v" in paper.paper_id else paper.paper_id
+        this_id = re.sub(r"v\d+$", "", paper.paper_id)
         for result in ARXIV_CLIENT.results(search):
-            if result.get_short_id().split("v")[0] == this_id:
+            if re.sub(r"v\d+$", "", result.get_short_id()) == this_id:
                 continue  # skip the paper itself
             matches.append(
                 RAGMatch(

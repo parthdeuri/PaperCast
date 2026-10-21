@@ -3,9 +3,13 @@ The Academic agent: reads one paper at a time and produces a dense summary
 with claims tied to specific quotes. Runs once per paper (up to 3), so a
 2-3 paper run produces 2-3 independent summaries for the Skeptic to compare.
 """
+import logging
+
 from ..models import PaperData, PaperSummary, Citation
 from ..llm_client import call_structured
 from ..cost_tracker import track_node
+
+logger = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = """You are "The Academic" - an enthusiastic AI researcher explaining a paper's \
 core contribution. Read the paper text provided and produce:
@@ -64,6 +68,7 @@ def academic_node(state: dict) -> dict:
     from concurrent.futures import ThreadPoolExecutor
     
     summaries = []
+    first_error = None
     with ThreadPoolExecutor(max_workers=3) as executor:
         futures = [executor.submit(_process_paper, paper, run_log) for paper in papers]
         for future in futures:
@@ -71,6 +76,12 @@ def academic_node(state: dict) -> dict:
                 summaries.append(future.result())
             except Exception as e:
                 # Log the error but don't crash the whole pipeline if one paper fails.
-                print(f"Error processing paper: {e}")
+                logger.warning(f"Error processing paper: {e}")
+                first_error = first_error or e
+
+    # Every paper failing is not a partial result - downstream nodes would
+    # just crash on empty summaries, so stop here with the real cause.
+    if not summaries:
+        raise ValueError(f"Academic agent failed for every paper: {first_error}")
 
     return {"summaries": summaries, "run_log": run_log}

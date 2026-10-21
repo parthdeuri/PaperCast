@@ -28,3 +28,7 @@ env/
 .claude/
 .DS_Store
 Thumbs.db
+
+# Runtime caches and checkpoints
+cache/
+checkpoints.sqlite*

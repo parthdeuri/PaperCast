@@ -8,9 +8,12 @@ Failure modes this handles explicitly (this is the part tutorials skip):
     images, weird layout) -> falls back to abstract-only mode rather than
     silently passing an empty string downstream.
   - Network/arxiv API failure -> retried with backoff before giving up.
+  - Papers fetched in full are cached on disk (config.ARXIV_CACHE_DIR), so
+    re-running the same paper skips both the arXiv call and the PDF download.
 """
 import re
 import os
+import hashlib
 import tempfile
 import logging
 import requests
@@ -126,8 +129,34 @@ def _extract_intro_and_conclusion(pdf_path: str) -> str:
     return full_text[: config.MAX_FULLTEXT_CHARS_PER_PAPER]
 
 
-def _extract_local_pdf(pdf_path: str) -> PaperData:
-    """Extract text from a local PDF and use an LLM to infer its metadata and domain."""
+def _cache_path(arxiv_id: str) -> str:
+    return os.path.join(config.ARXIV_CACHE_DIR, f"{arxiv_id.replace('/', '_')}.json")
+
+
+def _read_cache(arxiv_id: str):
+    """Return the cached PaperData, or None. A missing or corrupt file is
+    just a cache miss."""
+    if not _ARXIV_ID_RE.match(arxiv_id):
+        return None
+    try:
+        with open(_cache_path(arxiv_id), encoding="utf-8") as f:
+            return PaperData.model_validate_json(f.read())
+    except (OSError, ValueError):
+        return None
+
+
+def _write_cache(paper: PaperData) -> None:
+    try:
+        os.makedirs(config.ARXIV_CACHE_DIR, exist_ok=True)
+        with open(_cache_path(paper.paper_id), "w", encoding="utf-8") as f:
+            f.write(paper.model_dump_json())
+    except OSError as e:
+        logger.warning(f"Could not write arXiv cache for {paper.paper_id}: {e}")
+
+
+def _extract_local_pdf(pdf_path: str, usage: dict = None) -> PaperData:
+    """Extract text from a local PDF and use an LLM to infer its metadata and domain.
+    If `usage` is given, the LLM call's token counts are added to it."""
     if fitz is None:
         raise IngestionError("PyMuPDF (fitz) is not installed, cannot read local PDFs")
     
@@ -149,6 +178,9 @@ def _extract_local_pdf(pdf_path: str) -> PaperData:
     try:
         response = call_structured(system_prompt, user_prompt, PDFMetadata, mock_factory=mock_metadata)
         meta = response.parsed
+        if usage is not None:
+            usage["input_tokens"] = usage.get("input_tokens", 0) + response.input_tokens
+            usage["output_tokens"] = usage.get("output_tokens", 0) + response.output_tokens
     except Exception as e:
         logger.warning(f"Failed to extract metadata via LLM for {pdf_path}: {e}")
         meta = mock_metadata()
@@ -163,8 +195,13 @@ def _extract_local_pdf(pdf_path: str) -> PaperData:
 
     combined_text = f"Title: {meta.title}\n\nAbstract: {meta.abstract}\n\n{full_text}"
     
+    # Hash the file contents so the ID is stable across runs and doesn't
+    # depend on where the file happens to live (e.g. a fresh temp dir).
+    with open(pdf_path, "rb") as f:
+        paper_id = "pdf-" + hashlib.sha256(f.read()).hexdigest()[:10]
+
     return PaperData(
-        paper_id=pdf_path,
+        paper_id=paper_id,
         title=meta.title,
         authors=meta.authors,
         abstract=meta.abstract,
@@ -175,15 +212,16 @@ def _extract_local_pdf(pdf_path: str) -> PaperData:
     )
 
 
-def fetch_paper(source_id: str, download_pdf: bool = True) -> PaperData:
+def fetch_paper(source_id: str, download_pdf: bool = True, usage: dict = None) -> PaperData:
     """Fetch a single paper. source_id can be an arxiv_id or a local PDF file path.
     Never raises for recoverable issues - instead returns a PaperData with 
-    extraction_mode reflecting what actually happened."""
+    extraction_mode reflecting what actually happened. `usage`, if given,
+    collects LLM token counts (only local PDFs make an LLM call here)."""
     source_id = source_id.strip()
     
     if source_id.lower().endswith(".pdf") and os.path.exists(source_id):
         try:
-            return _extract_local_pdf(source_id)
+            return _extract_local_pdf(source_id, usage)
         except IngestionError as e:
             logger.error(str(e))
             return PaperData(
@@ -195,6 +233,10 @@ def fetch_paper(source_id: str, download_pdf: bool = True) -> PaperData:
                 char_count=0,
                 domain="Unknown"
             )
+
+    cached = _read_cache(source_id)
+    if cached is not None:
+        return cached
 
     try:
         result = _fetch_arxiv_result(source_id)
@@ -250,7 +292,7 @@ def fetch_paper(source_id: str, download_pdf: bool = True) -> PaperData:
 
     combined_text = f"Title: {title}\n\nAbstract: {abstract}\n\n{full_text}"
 
-    return PaperData(
+    paper = PaperData(
         paper_id=source_id,
         title=title,
         authors=authors,
@@ -260,11 +302,17 @@ def fetch_paper(source_id: str, download_pdf: bool = True) -> PaperData:
         char_count=len(combined_text),
         domain=domain_heuristic
     )
+    # Only cache full extractions: an abstract-only result may just mean the
+    # PDF download failed this time, and shouldn't stick forever.
+    if mode == "full":
+        _write_cache(paper)
+    return paper
 
 
-def fetch_papers(input_sources: List[str], download_pdf: bool = True) -> List[PaperData]:
+def fetch_papers(input_sources: List[str], download_pdf: bool = True, usage: dict = None) -> List[PaperData]:
     """Fetch 1-MAX_PAPERS papers. Invalid IDs or local files are dropped with a logged
-    warning rather than failing the whole batch."""
+    warning rather than failing the whole batch. If `usage` is given, it gets
+    the summed input_tokens/output_tokens of any LLM calls made while ingesting."""
     if not (config.MIN_PAPERS <= len(input_sources) <= config.MAX_PAPERS):
         raise ValueError(
             f"Expected {config.MIN_PAPERS}-{config.MAX_PAPERS} input sources, got {len(input_sources)}"
@@ -272,9 +320,12 @@ def fetch_papers(input_sources: List[str], download_pdf: bool = True) -> List[Pa
 
     from concurrent.futures import ThreadPoolExecutor
     papers = []
+    # One usage dict per source so worker threads never share a counter.
+    usages = [{"input_tokens": 0, "output_tokens": 0} for _ in input_sources]
     
     with ThreadPoolExecutor(max_workers=3) as executor:
-        futures = [executor.submit(fetch_paper, source, download_pdf) for source in input_sources]
+        futures = [executor.submit(fetch_paper, source, download_pdf, u)
+                   for source, u in zip(input_sources, usages)]
         for future, source in zip(futures, input_sources):
             try:
                 paper = future.result()
@@ -284,6 +335,10 @@ def fetch_papers(input_sources: List[str], download_pdf: bool = True) -> List[Pa
                 papers.append(paper)
             except Exception as e:
                 logger.warning(f"Error fetching '{source}': {e}")
+
+    if usage is not None:
+        usage["input_tokens"] = usage.get("input_tokens", 0) + sum(u["input_tokens"] for u in usages)
+        usage["output_tokens"] = usage.get("output_tokens", 0) + sum(u["output_tokens"] for u in usages)
 
     if not papers:
         raise ValueError("None of the provided input sources could be fetched.")

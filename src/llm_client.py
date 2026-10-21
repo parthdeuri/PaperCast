@@ -5,9 +5,12 @@ Two responsibilities:
   1. Always use structured output (.with_structured_output) so agent
      responses are validated Pydantic objects, never free text we regex out.
   2. Support MOCK_MODE (see config.py) so the entire graph can be exercised
-     - including cost tracking and citation grounding - without an API key
-     or network access. This is what lets you unit test the pipeline logic
-     separately from "does the LLM produce a good debate script".
+     - including cost tracking and citation grounding - without an LLM API
+     key. Mock mode only replaces the LLM calls: fetching papers from arXiv
+     and the RAG embedding model still use the network unless they are
+     stubbed out, as the test suite does. This is what lets you test the
+     pipeline logic separately from "does the LLM produce a good debate
+     script".
 """
 from typing import Type, TypeVar
 from pydantic import BaseModel
